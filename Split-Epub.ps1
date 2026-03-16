@@ -32,7 +32,7 @@ param(
 )
 
 #region CONFIGURATION
-$PythonScript = Join-Path -Path $PSScriptRoot -ChildPath 'epub_splitter.py'
+$PythonScript = Join-Path -Path $PSScriptRoot -ChildPath 'src/epub_splitter.py'
 #endregion
 
 # Orchestration block

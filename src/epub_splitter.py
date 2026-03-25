@@ -31,6 +31,9 @@ def main() -> None:
     # Load the ePub
     book = epub.read_epub(args.epub, {"ignore_ncx": False})
 
+    # Resolve the display title once so we can use it for output folder naming
+    book_title = get_book_title(book)
+
     # Build the TOC-based chapter map (href -> title) from NCX/nav
     toc_map = build_toc_map(book)
 
@@ -40,14 +43,15 @@ def main() -> None:
     # Extract chapter titles and text from each spine item
     chapters = extract_chapters(spine_items, toc_map)
 
-    # Write each chapter to a text file in the output directory
-    output_dir = Path(args.output)
+    # Write each chapter into a title-based subfolder under the output root
+    output_root = Path(args.output)
+    output_dir = output_root / sanitize_filename(book_title)
     output_dir.mkdir(parents=True, exist_ok=True)
     written = write_chapters(chapters, output_dir)
 
     # Return JSON summary to the calling process
     summary = {
-        "book_title": get_book_title(book),
+        "book_title": book_title,
         "chapters_written": written,
         "output_directory": str(output_dir.resolve()),
     }

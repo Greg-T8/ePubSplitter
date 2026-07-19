@@ -21,6 +21,7 @@ The Python back-end (`src/epub_splitter.py`) does the heavy lifting; the PowerSh
 | Python | 3.10 or later |
 | ebooklib | latest |
 | beautifulsoup4 | latest |
+| cpdf | latest |
 
 ### Install dependencies
 
@@ -40,10 +41,22 @@ pip install ebooklib beautifulsoup4
 .\Split-Epub.ps1 -EpubPath "input\MyBook.epub"
 ```
 
+```powershell
+.\Split-PDF.ps1 -PdfPath "input\MyBook.pdf"
+```
+
 Output files are written to `.\output\` by default.
 
 ```powershell
 .\Split-Epub.ps1 -EpubPath "input\MyBook.epub" -OutputDir "C:\Books\MyBook"
+```
+
+For PDF splitting, if `-OutputDir` is omitted, chapter files are written to a folder
+named after the source PDF beside the source file. When a part is detected,
+filenames use `Part-01_Chapter-01_<chapter title>.pdf`.
+
+```powershell
+.\Split-PDF.ps1 -PdfPath "input\MyBook.pdf" -OutputDir "C:\Books\MyBook"
 ```
 
 Use `-Verbose` to see Python interpreter details and any warnings:

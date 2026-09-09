@@ -53,6 +53,7 @@ param(
 
 #region CONFIGURATION
 $PythonScript = Join-Path -Path $PSScriptRoot -ChildPath 'src/pdf_splitter.py'
+$OutputDirWasSpecified = $PSBoundParameters.ContainsKey('OutputDir')
 #endregion
 
 $Main = {
@@ -63,6 +64,15 @@ $Main = {
 
     # Verify the venv Python, the back-end script, and PyMuPDF are available
     Confirm-Prerequisite
+
+    # Warn when list mode is used with an explicit output directory
+    if ($Action -eq 'List' -and $OutputDirWasSpecified) {
+        Write-Warning (
+            "Action 'List' only displays bookmarks and does not create PDF files. " +
+            "The provided OutputDir '$OutputDir' is ignored. " +
+            "Use -Action Split or -Action Tree to write files."
+        )
+    }
 
     # Invoke the Python back-end for the requested action
     $result = Invoke-PdfSplitter -PdfFile $resolvedPdf -Output $OutputDir

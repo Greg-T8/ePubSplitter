@@ -1,16 +1,18 @@
 # -------------------------------------------------------------------------
 # Program: pdf_splitter.py
 # Description: List PDF bookmarks or split a PDF into per-section PDF files
-#              at a chosen bookmark level. Used as the back-end engine for
-#              the PowerShell wrapper Split-PDF-MuPDF.ps1.
+#              at a chosen bookmark level or selected bookmark subtree. Used
+#              as the back-end engine for Split-PDF-MuPDF.ps1.
 # Context: ePubSplitter utility project
 # Author: Greg Tate
 # -------------------------------------------------------------------------
 
 #region IMPORTS
 import argparse
+import difflib
 import json
 import re
+import sys
 from pathlib import Path
 
 import fitz
@@ -29,13 +31,23 @@ def main() -> None:
     # Read the table of contents as [level, title, page] entries
     toc = doc.get_toc()
 
-    # Dispatch on the requested action
-    if args.action == "list":
-        summary = list_bookmarks(pdf_title, toc)
-    elif args.action == "tree":
-        summary = split_tree(doc, pdf_title, toc, args)
-    else:
-        summary = split_pdf(doc, pdf_title, toc, args)
+    # Apply the split default after preserving an omitted level for List filtering.
+    if args.action == "split" and args.level is None:
+        args.level = 1
+
+    # Dispatch on the requested action, including an optional section export.
+    try:
+        if args.action == "list":
+            summary = list_bookmarks(pdf_title, toc, args.level)
+        elif args.action == "tree":
+            summary = split_tree(doc, pdf_title, toc, args)
+        elif args.section:
+            summary = split_section(doc, pdf_title, toc, args)
+        else:
+            summary = split_pdf(doc, pdf_title, toc, args)
+    except SectionSelectionError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from error
 
     # Return JSON summary to the calling process
     print(json.dumps(summary, indent=2))
@@ -64,15 +76,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-l", "--level",
         type=int,
-        default=1,
-        help="Bookmark level to split at (default: 1).",
+        default=None,
+        help=(
+            "Bookmark level to split at, or filter to when using List. "
+            "Split defaults to level 1; List shows all levels unless set."
+        ),
     )
     parser.add_argument(
         "-o", "--output",
         default="output",
         help="Directory for output PDF files (default: ./output).",
     )
-    return parser.parse_args()
+
+    parser.add_argument(
+        "--section",
+        help=(
+            "Bookmark title or full bookmark path to export as one PDF with "
+            "all subsections. Valid only with --action split."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    # Reject section selection for actions that do not write one selected section.
+    if args.section and args.action != "split":
+        parser.error("--section can only be used with --action split.")
+
+    if args.section is not None and not args.section.strip():
+        parser.error("--section cannot be empty.")
+
+    return args
 
 
 def get_pdf_title(doc: fitz.Document, pdf_path: str) -> str:
@@ -90,24 +123,35 @@ def get_pdf_title(doc: fitz.Document, pdf_path: str) -> str:
     return Path(pdf_path).stem
 
 
-def list_bookmarks(pdf_title: str, toc: list) -> dict:
+def list_bookmarks(
+    pdf_title: str,
+    toc: list,
+    level: int | None = None,
+) -> dict:
     """Build a JSON-serializable summary of every bookmark in the PDF."""
+    # Resolve ancestor titles so List exposes the path accepted by --section.
+    toc_records = build_toc_records(toc)
     bookmarks = []
 
     # Flatten each TOC entry into a simple level/title/page record
-    for entry in toc:
-        level, title, page = entry[0], entry[1], entry[2]
+    for record, entry in zip(toc_records, toc):
+        if level is not None and record["level"] != level:
+            continue
+
+        entry_level, title, page = entry[0], entry[1], entry[2]
         bookmarks.append(
             {
-                "level": int(level),
+                "level": int(entry_level),
                 "title": str(title).strip(),
                 "page": int(page),
+                "section_name": " > ".join(record["path_titles"]),
             }
         )
 
     return {
         "pdf_title": pdf_title,
         "bookmark_count": len(bookmarks),
+        "level_filter": level,
         "bookmarks": bookmarks,
     }
 
@@ -146,6 +190,44 @@ def split_pdf(
     return {
         "pdf_title": pdf_title,
         "level": args.level,
+        "sections_written": written,
+        "output_directory": str(output_dir.resolve()),
+    }
+
+
+class SectionSelectionError(ValueError):
+    """Raised when a requested bookmark section cannot be selected safely."""
+
+
+def split_section(
+    doc: fitz.Document,
+    pdf_title: str,
+    toc: list,
+    args: argparse.Namespace,
+) -> dict:
+    """Export one selected bookmark and its complete descendant subtree."""
+    # Resolve bookmark metadata once so selection, ranges, and output navigation align.
+    toc_records = build_toc_records(toc)
+    selected = select_section(toc_records, args.section)
+    section = build_selected_section_range(
+        toc_records=toc_records,
+        selected=selected,
+        total_pages=doc.page_count,
+    )
+
+    # Write the selected section into the same title-based output folder as Split.
+    output_root = Path(args.output)
+    output_dir = output_root / sanitize_filename(pdf_title)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = write_sections(doc, [section], output_dir)
+
+    return {
+        "pdf_title": pdf_title,
+        "level": section["level"],
+        "section": section["title"],
+        "section_path": " > ".join(section["path_titles"]),
+        "start_page": section["start_page"] + 1,
+        "end_page": section["end_page"] + 1,
         "sections_written": written,
         "output_directory": str(output_dir.resolve()),
     }
@@ -323,6 +405,7 @@ def build_toc_records(toc: list) -> list[dict]:
                 "level": level,
                 "title": title,
                 "ancestor_titles": ancestor_titles,
+                "path_titles": [*ancestor_titles, title],
                 "resolved_page": resolve_start_page(
                     toc=toc,
                     index=index,
@@ -338,6 +421,159 @@ def build_toc_records(toc: list) -> list[dict]:
         )
 
     return records
+
+
+def normalize_section_selector(value: str) -> str:
+    """Normalize a title or path segment for case- and punctuation-insensitive matching."""
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+
+
+def normalize_section_path(value: str) -> tuple[str, ...]:
+    """Normalize a section selector into its individual path segments."""
+    return tuple(
+        normalized
+        for normalized in (
+            normalize_section_selector(segment)
+            for segment in re.split(r"\s*>\s*", value.strip())
+        )
+        if normalized
+    )
+
+
+def select_section(
+    toc_records: list[dict],
+    selector: str,
+) -> dict:
+    """Select one bookmark by normalized title or full bookmark path."""
+    selector_path = normalize_section_path(selector)
+
+    if not selector_path:
+        raise SectionSelectionError(
+            f"Section selector '{selector}' contains no searchable title text."
+        )
+
+    matches = []
+
+    for record in toc_records:
+        record_path = tuple(
+            normalize_section_selector(title)
+            for title in record["path_titles"]
+        )
+
+        if len(selector_path) == 1:
+            is_match = record_path[-1:] == selector_path
+        else:
+            is_match = record_path == selector_path
+
+        if is_match:
+            matches.append(record)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        raise SectionSelectionError(build_no_match_message(toc_records, selector))
+
+    lines = [
+        f"Section selector '{selector}' matched multiple bookmarks. "
+        "Use a full bookmark path with '>' to disambiguate:",
+    ]
+
+    for record in matches:
+        lines.append(
+            "  - "
+            f"{' > '.join(record['path_titles'])} "
+            f"(level {record['level']}, page {record['resolved_page'] or 'unresolved'})"
+        )
+
+    raise SectionSelectionError("\n".join(lines))
+
+
+def build_no_match_message(toc_records: list[dict], selector: str) -> str:
+    """Build a useful error containing the closest bookmark path suggestions."""
+    selector_path = normalize_section_path(selector)
+    normalized_query = selector_path[-1] if selector_path else ""
+    unique_titles = {}
+
+    for record in toc_records:
+        title_key = normalize_section_selector(record["title"])
+        unique_titles.setdefault(title_key, record)
+
+    close_keys = difflib.get_close_matches(
+        normalized_query,
+        list(unique_titles),
+        n=5,
+        cutoff=0.35,
+    )
+
+    lines = [f"No bookmark matched section selector '{selector}'."]
+
+    if close_keys:
+        lines.append("Similar bookmark titles:")
+
+        for key in close_keys:
+            record = unique_titles[key]
+            lines.append(f"  - {' > '.join(record['path_titles'])}")
+    else:
+        lines.append("No similar bookmark titles were found.")
+
+    return "\n".join(lines)
+
+
+def build_selected_section_range(
+    toc_records: list[dict],
+    selected: dict,
+    total_pages: int,
+) -> dict:
+    """Build one page range containing a bookmark and all descendants."""
+    start_page_1b = selected["resolved_page"]
+
+    if start_page_1b is None:
+        raise SectionSelectionError(
+            "Selected bookmark has no navigable page: "
+            f"{' > '.join(selected['path_titles'])}"
+        )
+
+    subtree_end = find_subtree_end_index(
+        toc_records=toc_records,
+        start_index=selected["index"],
+        split_level=selected["level"],
+    )
+    end_page_1b = total_pages
+
+    # Stop before the first navigable sibling or ancestor-level bookmark.
+    for boundary in toc_records[subtree_end:]:
+        if boundary["level"] <= selected["level"]:
+            if boundary["resolved_page"] is not None:
+                end_page_1b = boundary["resolved_page"] - 1
+                break
+
+    if end_page_1b < start_page_1b:
+        raise SectionSelectionError(
+            "Selected bookmark has an invalid page range: "
+            f"{' > '.join(selected['path_titles'])}"
+        )
+
+    return {
+        "title": selected["title"],
+        "level": selected["level"],
+        "path_titles": selected["path_titles"],
+        "name_parts": build_section_name_parts(
+            mark=selected,
+            split_level=selected["level"],
+        ),
+        "start_page": start_page_1b - 1,
+        "end_page": end_page_1b - 1,
+        "bookmarks": build_section_bookmarks(
+            toc_records=toc_records,
+            start_index=selected["index"],
+            end_index=subtree_end,
+            split_level=selected["level"],
+            start_page_1b=start_page_1b,
+            end_page_1b=end_page_1b,
+            section_title=selected["title"],
+        ),
+    }
 
 
 def find_subtree_end_index(

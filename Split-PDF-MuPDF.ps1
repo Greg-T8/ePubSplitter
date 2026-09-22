@@ -7,18 +7,64 @@ Wrapper script that invokes the Python back-end (pdf_splitter.py) which uses
 PyMuPDF (fitz). The Python interpreter is taken exclusively from a dedicated
 virtual environment; the script never falls back to a native Python on PATH.
 
-Two actions are supported:
-  List  - print every bookmark with its level and page.
+Three actions are supported:
+  List  - return bookmark PSCustomObjects with level, page, title, and the
+          full SectionName path. Use -Level to filter the returned objects.
   Split - split the PDF into one PDF per bookmark at the requested level.
+          Use -Section to export one bookmark and all of its subsections as a
+          single PDF.
+
+List output is intended for the PowerShell pipeline. The SectionName property
+can be passed directly to -Section. A leaf title may be used when unique; use
+the full SectionName path with '>' when duplicate titles exist.
+
+.EXAMPLE
+.\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action List -Level 3
+
+Returns only level-3 bookmark objects. Each object includes Level, Page, Title,
+and SectionName properties.
+
+.EXAMPLE
+$bookmarks = .\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action List -Level 3
+$section = $bookmarks |
+    Where-Object { $_.Title -eq 'Unique section title' } |
+    Select-Object -First 1 -ExpandProperty SectionName
+.\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action Split -Section $section
+
+Lists level-3 bookmarks, obtains the full SectionName path, and exports the
+selected bookmark with all of its subsections.
+
+.OUTPUTS
+System.Management.Automation.PSCustomObject
+
+When Action is List, each output object contains Level, Page, Title, and
+SectionName properties. Split and Tree return no bookmark-list objects.
+
+.EXAMPLE
+.\Split-PDF-MuPDF.ps1 `
+    -PdfPath "input\sql-sql-server-ver17.pdf" `
+    -Action Split `
+    -Section "SQL Server on Linux > High availability and disaster recovery > Availability groups"
+
+Exports one path-qualified section when the leaf title is duplicated. The
+selected bookmark's descendant bookmarks and pages are retained in the output.
 
 .PARAMETER PdfPath
 Path to the input .pdf file.
 
 .PARAMETER Action
-Operation to perform: List (default), Split, or Tree.
+Operation to perform: List (default), Split, or Tree. List returns structured
+bookmark objects; Split writes PDFs; Tree writes own-content-only PDFs.
 
 .PARAMETER Level
-Bookmark level to split at when Action is Split. Defaults to 1.
+Bookmark level to split at when Action is Split, or filter to when Action is
+List. Split defaults to level 1; List displays all levels unless specified.
+
+.PARAMETER Section
+Bookmark title or full SectionName path to export as one PDF with all of its
+subsections. Titles are matched case-insensitively after normalizing spacing,
+punctuation, and hyphens. A leaf title must be unique; duplicate titles must
+use the full path with '>'. Valid only with Action Split.
 
 .PARAMETER OutputDir
 Directory for output PDF files. Defaults to .\output.
@@ -46,6 +92,8 @@ param(
 
     [int]$Level = 1,
 
+    [string]$Section,
+
     [string]$OutputDir = (Join-Path -Path $PSScriptRoot -ChildPath 'output'),
 
     [string]$PythonEnv = (Join-Path -Path $PSScriptRoot -ChildPath '.venv/pymupdf')
@@ -54,6 +102,7 @@ param(
 #region CONFIGURATION
 $PythonScript = Join-Path -Path $PSScriptRoot -ChildPath 'src/pdf_splitter.py'
 $OutputDirWasSpecified = $PSBoundParameters.ContainsKey('OutputDir')
+$LevelWasSpecified = $PSBoundParameters.ContainsKey('Level')
 #endregion
 
 $Main = {
@@ -61,6 +110,12 @@ $Main = {
 
     # Resolve the full path of the input PDF file
     $resolvedPdf = (Resolve-Path -Path $PdfPath).Path
+
+    # Restrict section selection to the combined Split action.
+    if (-not [string]::IsNullOrWhiteSpace($Section) -and $Action -ne 'Split') {
+        Write-Error "The -Section parameter is valid only with -Action Split."
+        exit 1
+    }
 
     # Verify the venv Python, the back-end script, and PyMuPDF are available
     Confirm-Prerequisite
@@ -75,7 +130,11 @@ $Main = {
     }
 
     # Invoke the Python back-end for the requested action
-    $result = Invoke-PdfSplitter -PdfFile $resolvedPdf -Output $OutputDir
+    $result = Invoke-PdfSplitter `
+        -PdfFile $resolvedPdf `
+        -Output $OutputDir `
+        -SelectedSection $Section `
+        -IncludeLevel $LevelWasSpecified
 
     # Display results appropriate to the action
     if ($Action -eq 'List') {
@@ -157,7 +216,9 @@ $Helpers = {
         # Run the Python back-end and return the parsed JSON result.
         param(
             [string]$PdfFile,
-            [string]$Output
+            [string]$Output,
+            [string]$SelectedSection,
+            [bool]$IncludeLevel
         )
 
         Write-Host "Action:     $Action" -ForegroundColor Cyan
@@ -165,6 +226,9 @@ $Helpers = {
 
         if ($Action -eq 'Split') {
             Write-Host "Level:      $Level" -ForegroundColor Cyan
+            if (-not [string]::IsNullOrWhiteSpace($SelectedSection)) {
+                Write-Host "Section:    $SelectedSection" -ForegroundColor Cyan
+            }
             Write-Host "Output to:  $Output" -ForegroundColor Cyan
         }
         elseif ($Action -eq 'Tree') {
@@ -172,10 +236,24 @@ $Helpers = {
         }
 
         # Execute the Python script and capture stdout and stderr
-        $raw = & $Script:PythonExe $PythonScript $PdfFile `
-            '--action' $Action.ToLower() `
-            '--level' $Level `
-            '-o' $Output 2>&1
+        # Build the backend argument list while preserving the existing defaults.
+        $arguments = @(
+            $PythonScript,
+            $PdfFile,
+            '--action', $Action.ToLower()
+        )
+
+        if ($Action -ne 'List' -or $IncludeLevel) {
+            $arguments += @('--level', [string]$Level)
+        }
+
+        $arguments += @('-o', $Output)
+
+        if (-not [string]::IsNullOrWhiteSpace($SelectedSection)) {
+            $arguments += @('--section', $SelectedSection)
+        }
+
+        $raw = & $Script:PythonExe @arguments 2>&1
 
         # Separate stderr warnings from stdout JSON
         $stderr = $raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }
@@ -200,7 +278,7 @@ $Helpers = {
 
     #region DISPLAY
     function Show-BookmarkList {
-        # Display every bookmark returned by the back-end as a table.
+        # Return every bookmark returned by the back-end as structured objects.
         param(
             [PSObject]$Result
         )
@@ -209,13 +287,30 @@ $Helpers = {
         Write-Host '--- PDF Bookmarks ---' -ForegroundColor Green
         Write-Host "PDF Title:       $($Result.pdf_title)"
         Write-Host "Bookmark Count:  $($Result.bookmark_count)"
+
+        if ($null -eq $Result.level_filter) {
+            Write-Host 'Level Filter:    All'
+        }
+        else {
+            Write-Host "Level Filter:    $($Result.level_filter)"
+        }
+
         Write-Host ''
 
-        # Render the bookmark records as an indented table
+        # Return the bookmark records as structured pipeline objects.
         if ($Result.bookmark_count -gt 0) {
-            $Result.bookmarks |
-                Select-Object Level, Page, Title |
-                Format-Table -AutoSize
+            # Materialize the display rows so callers can pipe them to PowerShell commands.
+            $bookmarkRows = @($Result.bookmarks |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        Level       = $_.level
+                        Page        = $_.page
+                        Title       = $_.title
+                        SectionName = $_.section_name
+                    }
+                })
+
+            $bookmarkRows
         }
         else {
             Write-Host 'No bookmarks were found in this PDF.' -ForegroundColor Yellow
@@ -235,6 +330,11 @@ $Helpers = {
         # Show the split level only for single-level splits
         if ($Action -eq 'Split') {
             Write-Host "Split Level:      $($Result.level)"
+
+            if ($Result.section_path) {
+                Write-Host "Selected Section: $($Result.section_path)"
+                Write-Host "Source Pages:     $($Result.start_page)-$($Result.end_page)"
+            }
         }
 
         Write-Host "Sections Written: $($Result.sections_written)"
@@ -258,7 +358,12 @@ $Helpers = {
                 Write-Warning 'No navigable bookmarks with exclusive pages were found. Nothing was written.'
             }
             else {
-                Write-Warning "No bookmarks at level $Level were found. Nothing was written."
+                if ($Result.section_path) {
+                    Write-Warning "The selected section did not produce a navigable page range. Nothing was written."
+                }
+                else {
+                    Write-Warning "No bookmarks at level $Level were found. Nothing was written."
+                }
             }
             exit 1
         }

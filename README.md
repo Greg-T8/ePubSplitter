@@ -81,10 +81,28 @@ python -m venv "$HOME\Python_Env\pymupdf"
 pip install pymupdf
 ```
 
-List every bookmark with its level and page (default action):
+List every bookmark with its level, page, title, and full `SectionName` path
+(default action). The command returns `PSCustomObject` rows, and the displayed
+`SectionName` can be copied directly into `-Section` when a full path is needed
+to disambiguate duplicate titles:
 
 ```powershell
 .\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf"
+```
+
+Filter the listing to one bookmark level with `-Level`:
+
+```powershell
+.\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action List -Level 3
+```
+
+When `-Level` is omitted with `List`, bookmarks at all levels are displayed.
+
+`List` results can be filtered or exported with standard PowerShell commands:
+
+```powershell
+.\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action List -Level 3 |
+    Export-Csv -Path "output\MyBook-level-3-bookmarks.csv" -NoTypeInformation
 ```
 
 Split the PDF into one PDF per bookmark at a chosen level:
@@ -92,6 +110,54 @@ Split the PDF into one PDF per bookmark at a chosen level:
 ```powershell
 .\Split-PDF-MuPDF.ps1 -PdfPath "input\MyBook.pdf" -Action Split -Level 1
 ```
+
+Export one bookmark and all of its subsections as a single PDF with
+`-Action Split -Section`. The value can be a leaf title or a full `SectionName` path.
+Section titles are matched case-insensitively after normalizing spaces,
+punctuation, and hyphens. A leaf title must be unique; use the full path with
+`>` when duplicate titles exist:
+
+For a PDF where the leaf title is unique:
+
+```powershell
+.\Split-PDF-MuPDF.ps1 `
+    -PdfPath "input\MyBook.pdf" `
+    -Action Split `
+    -Section "availability-groups"
+```
+
+To obtain a path directly from structured `List` output:
+
+```powershell
+$bookmarks = .\Split-PDF-MuPDF.ps1 `
+    -PdfPath "input\sql-sql-server-ver17.pdf" `
+    -Action List `
+    -Level 3
+
+$section = $bookmarks |
+    Where-Object {
+        $_.SectionName -eq "SQL Server on Linux > High availability and disaster recovery > Availability groups"
+    } |
+    Select-Object -First 1 -ExpandProperty SectionName
+
+.\Split-PDF-MuPDF.ps1 `
+    -PdfPath "input\sql-sql-server-ver17.pdf" `
+    -Action Split `
+    -Section $section
+```
+
+If a title occurs more than once, provide its full bookmark path using `>`:
+
+```powershell
+.\Split-PDF-MuPDF.ps1 `
+    -PdfPath "input\_OceanofPDF.com_The_Devils_-_Joe_Abercrombie\sql-sql-server-ver17.pdf" `
+    -Action Split `
+    -Section "SQL Server on Linux > High availability and disaster recovery > Availability groups"
+```
+
+For this PDF, the unqualified `availability-groups` selector is ambiguous
+because two bookmarks have that title. The path-qualified command selects the
+SQL Server on Linux section and includes its nested subsections.
 
 For deeper split levels, output file names include parent bookmark context so
 sections remain identifiable, for example:
